@@ -5,11 +5,12 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { Investment, InvestmentStatus } from './entities/investment.entity';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { TradeDeal, TradeDealStatus } from '../trade-deals/entities/trade-deal.entity';
 import { StellarService } from '../stellar/stellar.service';
+import { QueueService } from '../queue/queue.service';
 
 @Injectable()
 export class InvestmentsService {
@@ -19,6 +20,7 @@ export class InvestmentsService {
     @InjectRepository(TradeDeal)
     private readonly tradeDealRepo: Repository<TradeDeal>,
     private readonly stellarService: StellarService,
+    private readonly queueService: QueueService,
   ) {}
 
   async createInvestment(
@@ -115,7 +117,7 @@ export class InvestmentsService {
 
     await this.investmentRepo.save(investment);
 
-    // Update total invested on the trade deal
+    // Update total invested on the trade deal using confirmed investments sum
     const tradeDeal = investment.tradeDeal;
     const confirmedInvestments = await this.investmentRepo.find({
       where: { 
@@ -143,9 +145,16 @@ export class InvestmentsService {
     return investment;
   }
 
+  async markInvestmentFailed(investmentId: string): Promise<void> {
+    await this.investmentRepo.update(investmentId, {
+      status: InvestmentStatus.FAILED,
+    });
+  }
+
   async fundEscrow(
     investmentId: string,
     investorWalletAddress: string,
+    signedXdr?: string,
   ): Promise<{ stellarTxId: string }> {
     const investment = await this.investmentRepo.findOne({
       where: { id: investmentId },
@@ -163,21 +172,41 @@ export class InvestmentsService {
       });
     }
 
-    if (!investment.tradeDeal.escrowPublicKey) {
+    const deal = investment.tradeDeal;
+
+    if (!deal.escrowPublicKey) {
       throw new UnprocessableEntityException({
         code: 'NO_ESCROW_ACCOUNT',
         message: 'Trade deal does not have an escrow account.',
       });
     }
 
-    // Fund the escrow account via Stellar
+    // If a signed XDR is provided (investor signed via Freighter), enqueue async job
+    if (signedXdr) {
+      await this.queueService.enqueueInvestmentFund({
+        investmentId,
+        signedXdr,
+        escrowPublicKey: deal.escrowPublicKey,
+        encryptedEscrowSecret: deal.escrowSecretKey ?? '',
+        assetCode: deal.tokenSymbol,
+        tokenAmount: investment.tokenAmount,
+        investorWallet: investorWalletAddress,
+        amountUsd: Number(investment.amountUsd),
+      });
+      // Return a placeholder — actual txId will be set when job completes
+      return { stellarTxId: 'queued' };
+    }
+
+    // Synchronous path (backend-signed, used in tests / MVP fallback)
     const stellarTxId = await this.stellarService.fundEscrow(
-      investment.tradeDeal.escrowPublicKey,
+      deal.escrowPublicKey,
       investorWalletAddress,
       investment.amountUsd.toString(),
+      deal.escrowSecretKey ?? undefined,
+      deal.tokenSymbol,
+      investment.tokenAmount,
     );
 
-    // Auto-confirm the investment after successful funding
     await this.confirmInvestment(investmentId, stellarTxId);
 
     return { stellarTxId };

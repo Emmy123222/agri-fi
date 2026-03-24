@@ -24,4 +24,20 @@ export class QueueService {
   async enqueueDealDelivered(tradeDealId: string): Promise<void> {
     await this.emit('deal.delivered', { tradeDealId });
   }
+
+  /**
+   * Enqueue an investment.fund job to submit the signed XDR and confirm investment
+   */
+  async enqueueInvestmentFund(payload: {
+    investmentId: string;
+    signedXdr: string;
+    escrowPublicKey: string;
+    encryptedEscrowSecret: string;
+    assetCode: string;
+    tokenAmount: number;
+    investorWallet: string;
+    amountUsd: number;
+  }): Promise<void> {
+    await this.emit('investment.fund', payload);
+  }
 }
